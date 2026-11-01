@@ -5,8 +5,10 @@ name: Rust CI (reusable)
 # concurrency; this workflow owns the checks:
 #
 #   release label (exactly one of major/minor/patch/no-release, PR events only)
-#   pre-commit --all-files, cargo fmt, cargo clippy -D warnings, cargo test,
-#   cargo-deny, typos, actionlint, zizmor
+#   pre-commit --all-files, cargo fmt, cargo clippy -D warnings and cargo test
+#   (default features, then `feature_args`), cargo doc -D warnings,
+#   cargo-deny, typos, actionlint, zizmor; plus an MSRV job (cargo check on
+#   `package.rust-version`, skipped with a notice when it is absent)
 #
 # Tool versions are pinned here. cargo-deny, gitleaks and actionlint MUST stay
 # equal to what yadgarhq/actions' versions.yaml pins at the hook rev callers
@@ -21,7 +23,9 @@ on:
         type: string
         default: ""
       feature_args:
-        description: "Feature flags passed to cargo clippy and cargo test"
+        description: >-
+          Feature flags for a second cargo clippy and cargo test pass. Default
+          features are always checked first, without these flags.
         type: string
         default: "--all-features"
       apt_packages:
@@ -49,6 +53,10 @@ env:
   GITLEAKS_VERSION: "8.30.1"
   GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
   PRE_COMMIT_VERSION: "4.7.0"
+  # typos is a pre-commit hook (language: system) and a CI step: one pinned
+  # binary serves both. Checksum: sha256 of the release tarball below.
+  TYPOS_VERSION: "1.51.1"
+  TYPOS_SHA256: "93c301fd4120ff076e2cc2a6d6a61cab4a4bdb81899287c0938b452e56d1f454"
 
 jobs:
   ci:
@@ -115,16 +123,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
-      - name: Install cargo-deny, typos and zizmor
+      - name: Install cargo-deny and zizmor
         uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8  # v2.87.28
         with:
-          tool: cargo-deny@0.20.2,typos@1.51.1,zizmor@1.29.0
+          tool: cargo-deny@0.20.2,zizmor@1.29.0
 
       # Not in install-action's manifests at the pin above: downloaded and
       # checked against the sha256 yadgarhq/actions versions.yaml records.
-      - name: Install actionlint and gitleaks
+      - name: Install actionlint, gitleaks and typos
         run: |
           set -euo pipefail
+          file="$RUNNER_TEMP/typos.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/crate-ci/typos/releases/download/v${TYPOS_VERSION}/typos-v${TYPOS_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${TYPOS_SHA256}  ${file}" | sha256sum -c -
+          sudo tar -xzf "$file" -C /usr/local/bin ./typos
+          typos --version
           file="$RUNNER_TEMP/actionlint.tar.gz"
           curl -sSfL -o "$file" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
           echo "${ACTIONLINT_SHA256}  ${file}" | sha256sum -c -
@@ -155,20 +168,33 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
+      - name: cargo clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: cargo clippy
+        if: inputs.feature_args != ''
         env:
           FEATURE_ARGS: ${{ inputs.feature_args }}
         run: |
           # shellcheck disable=SC2086
           cargo clippy --workspace --all-targets $FEATURE_ARGS -- -D warnings
 
-      - name: cargo test
+      - name: cargo test (default features)
         if: inputs.run_tests
+        run: cargo test --workspace
+
+      - name: cargo test
+        if: inputs.run_tests && inputs.feature_args != ''
         env:
           FEATURE_ARGS: ${{ inputs.feature_args }}
         run: |
           # shellcheck disable=SC2086
           cargo test --workspace $FEATURE_ARGS
+
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --all-features
 
       - name: cargo deny
         run: cargo deny --all-features check
@@ -193,3 +219,59 @@ jobs:
           else
             echo "::warning::No .github directory to audit"
           fi
+
+  # MSRV: `package.rust-version` (or `workspace.package.rust-version`) of the
+  # root Cargo.toml. `cargo +<msrv>` overrides rust-toolchain.toml.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read rust-version
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          MSRV=$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              data = tomllib.load(f)
+          v = data.get("package", {}).get("rust-version") or data.get("workspace", {}).get("package", {}).get("rust-version") or ""
+          print(v if isinstance(v, str) else "")
+          PY
+          )
+          if [ -z "$MSRV" ]; then
+            echo "::notice::No rust-version in Cargo.toml; MSRV check skipped"
+          else
+            echo "MSRV: ${MSRV}"
+          fi
+          echo "version=${MSRV}" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        if: steps.msrv.outputs.version != '' && inputs.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt_packages }}
+        run: |
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Install MSRV toolchain
+        if: steps.msrv.outputs.version != ''
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      - name: cargo check (MSRV)
+        if: steps.msrv.outputs.version != ''
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo "+${MSRV}" check --workspace --locked
+          cargo "+${MSRV}" check --workspace --locked --all-features

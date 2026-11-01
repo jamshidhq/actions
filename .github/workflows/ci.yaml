@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
 
       - name: Python doctests
-        run: python3 -m doctest -v scripts/bump_version.py scripts/verify_package_version.py
+        run: python3 -m doctest -v scripts/bump_version.py scripts/verify_package_version.py scripts/create_bump_pr.py
 
       # bump_version.py on the fixture workspace: base max(no tag = 0.0.0,
       # Cargo.toml 0.1.0) = 0.1.0, minor bump -> 0.2.0, Cargo.toml rewritten.

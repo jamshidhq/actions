@@ -32,6 +32,28 @@ BOT_NAME = "github-actions[bot]"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 
 
+def normalize_changelog(text):
+    """Return `text` ending in exactly one newline (empty stays empty).
+
+    git-cliff keeps the blank lines a body template ends with, so the file can
+    end in "\\n\\n". The caller's end-of-file-fixer hook then fails CI on the
+    bump PR.
+
+    >>> normalize_changelog("# Changelog\\n\\n## [1.0.0]\\n\\n- a\\n\\n")
+    '# Changelog\\n\\n## [1.0.0]\\n\\n- a\\n'
+    >>> normalize_changelog("- a\\n\\n\\n\\n")
+    '- a\\n'
+    >>> normalize_changelog("- a")
+    '- a\\n'
+    >>> normalize_changelog("- a\\n")
+    '- a\\n'
+    >>> normalize_changelog("\\n\\n")
+    ''
+    """
+    stripped = text.rstrip()
+    return stripped + "\n" if stripped else ""
+
+
 def run(cmd, **kwargs):
     """Run a command, printing it first."""
     print(f"$ {' '.join(cmd)}")
@@ -114,6 +136,11 @@ def main():
         if result.returncode != 0:
             print(f"git-cliff failed: {result.stderr}")
             print("Skipping changelog update")
+        else:
+            with open("CHANGELOG.md") as f:
+                changelog = f.read()
+            with open("CHANGELOG.md", "w") as f:
+                f.write(normalize_changelog(changelog))
 
         # Commit and push
         run(["git", "add", "Cargo.toml", "Cargo.lock", "CHANGELOG.md"])

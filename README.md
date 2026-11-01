@@ -66,14 +66,21 @@ pass named secrets only.
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `toolchain` | string | `""` | Rust toolchain. Empty: the caller's `rust-toolchain.toml` |
-| `feature_args` | string | `--all-features` | Feature flags for `cargo clippy` and `cargo test` |
+| `feature_args` | string | `--all-features` | Feature flags for a second `cargo clippy` and `cargo test` pass. Default features always run first, without these flags. Empty: only the default pass |
 | `apt_packages` | string | `""` | Space-separated apt packages the crate needs to build |
 | `check_release_label` | boolean | `true` | Require exactly one of `major`/`minor`/`patch`/`no-release` on PR events |
 | `run_tests` | boolean | `true` | Run `cargo test` |
 
 No secrets. The job needs `contents: read`.
 
-Pinned tools: cargo-deny 0.20.2, typos 1.51.1, zizmor 1.29.0, actionlint
+Besides the checks above, the job runs `cargo doc --workspace --no-deps
+--all-features` with `RUSTDOCFLAGS=-D warnings`. A second job, `msrv`, reads
+`package.rust-version` (or `workspace.package.rust-version`) from the root
+`Cargo.toml` and runs `cargo +<msrv> check --workspace --locked` with default
+features and with `--all-features`. Without a `rust-version` it logs a notice
+and skips.
+
+Pinned tools: cargo-deny 0.20.2, typos 1.51.1 (release tarball, sha256-checked; serves the pre-commit hook and the CI step), zizmor 1.29.0, actionlint
 1.7.12, gitleaks 8.30.1, pre-commit 4.7.0. cargo-deny, gitleaks and
 actionlint must equal the versions in `yadgarhq/actions` `versions.yaml` at
 the hook `rev` callers use, because those hooks refuse other versions.
@@ -133,7 +140,14 @@ Output: `tag`, the released tag.
 Caller repository settings: enable "Allow GitHub Actions to create and approve
 pull requests". Create the four labels. Commit `Cargo.lock`. The bump PR does
 not get CI, because a PR opened with `GITHUB_TOKEN` triggers no workflows.
-Close and reopen it to run CI.
+Branch protection that requires checks leaves such a PR unmergeable until CI
+runs.
+
+Known limitation. GitHub does not start workflows for events that
+`GITHUB_TOKEN` causes. Workaround: close the bump PR and reopen it as a user.
+The reopen event then runs CI. Follow-up, not implemented: an optional input
+that takes a GitHub App installation token, so the app opens the bump PR and
+CI starts by itself.
 
 Deviation from jamshid: jamshid has a read-only build job and a separate
 write publish job. A library has no build artefact, so one `release` job holds
@@ -197,7 +211,7 @@ at `9839ef7bf9b776dcd322a9765ab3d2809faf45ea`):
 ```sh
 pre-commit install --hook-type pre-commit --hook-type commit-msg
 pre-commit run --all-files
-python3 -m doctest -v scripts/bump_version.py scripts/verify_package_version.py
+python3 -m doctest -v scripts/bump_version.py scripts/verify_package_version.py scripts/create_bump_pr.py
 cargo test --workspace --all-features
 actionlint && zizmor --offline .github
 ```
