@@ -24,8 +24,11 @@ name: Rust release (reusable)
 # packages) from a write `publish` job, inside a nested reusable workflow so
 # one concurrency group covers both. A library has no build artefact, so this
 # workflow computes the version and tags in ONE `release` job under job-level
-# concurrency `release`. One queued job per run means a newer pending run can
-# never slip between version computation and tag push.
+# concurrency `jamshidhq-rust-release-<owner/repo>`. One queued job per run
+# means a newer pending run can never slip between version computation and tag
+# push. The group name is deliberately unusual: a CALLER concurrency group with
+# the same name (on the calling job or the calling workflow) would hold the
+# group while this job waits for it — a deadlock. See README.
 #
 # QUEUE LIMIT (unchanged from jamshid): GitHub keeps at most ONE pending run
 # per concurrency group; a newer pending run cancels the older pending one.
@@ -44,9 +47,11 @@ on:
         type: string
         default: ""
       default_branch:
-        description: "Branch releases are cut from (the PR base must match)"
+        description: >-
+          Branch releases are cut from (the PR base must match). Empty: the
+          repository's default branch.
         type: string
-        default: "main"
+        default: ""
       publish:
         description: "Publish the crate to crates.io with trusted publishing"
         type: boolean
@@ -88,8 +93,9 @@ on:
       actions_read_token:
         description: >-
           Token with read access to jamshidhq/actions, used to check out this
-          workflow's scripts at the commit it runs at. Needed only while
-          jamshidhq/actions is private and the caller is another repository.
+          workflow's scripts at the commit it runs at. jamshidhq/actions is
+          public, so callers normally omit it. Needed only if jamshidhq/actions
+          is made private again and the caller is another repository.
         required: false
     outputs:
       tag:
@@ -126,7 +132,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EVENT_NAME: ${{ github.event_name }}
-          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+          DEFAULT_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch }}
           DRY_RUN: ${{ inputs.dry_run }}
           DRY_RUN_RELEASE_TYPE: ${{ inputs.dry_run_release_type }}
           CURRENT_SHA: ${{ github.sha }}
@@ -211,7 +217,7 @@ jobs:
     # Dry runs get their own group so a PR self-test never queues behind (or
     # cancels the pending slot of) a real release.
     concurrency:
-      group: ${{ inputs.dry_run && format('release-dry-run-{0}', github.run_id) || 'release' }}
+      group: ${{ inputs.dry_run && format('jamshidhq-rust-release-dry-run-{0}', github.run_id) || format('jamshidhq-rust-release-{0}', github.repository) }}
       cancel-in-progress: false
     permissions:
       contents: write        # push tag + bump branch, create release
@@ -244,13 +250,22 @@ jobs:
           fi
           echo "sha=${OWN_SHA}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - id: own_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: jamshidhq/actions
           ref: ${{ steps.own_sha.outputs.sha }}
           path: .jamshid-actions
           token: ${{ secrets.actions_read_token || github.token }}
           persist-credentials: false
+
+      - name: Explain a failed script checkout
+        if: failure() && steps.own_checkout.outcome == 'failure'
+        env:
+          OWN_SHA: ${{ steps.own_sha.outputs.sha }}
+        run: |
+          echo "::error::cannot read jamshidhq/actions at ${OWN_SHA}: repo private? pass actions_read_token"
+          exit 1
 
       # Out of the caller's tree, so it never lands in a commit or a package.
       - name: Move scripts out of the workspace
@@ -319,11 +334,7 @@ jobs:
       - name: Select git-cliff config
         if: steps.existing.outputs.skip != 'true'
         run: |
-          if [ -f cliff.toml ]; then
-            CFG="$GITHUB_WORKSPACE/cliff.toml"
-          else
-            CFG="$ACTIONS_DIR/cliff.toml"
-          fi
+          CFG=$(bash "$ACTIONS_DIR/scripts/select_cliff_config.sh")
           echo "git-cliff config: ${CFG}"
           echo "CLIFF_CONFIG=${CFG}" >> "$GITHUB_ENV"
 
@@ -334,6 +345,17 @@ jobs:
           RELEASE_TYPE: ${{ needs.decide.outputs.release_type }}
           EXISTING_TAG: ${{ steps.existing.outputs.tag }}
         run: python3 "$ACTIONS_DIR/scripts/bump_version.py"
+
+      # With publish: true, fail BEFORE the tag exists when cargo would publish
+      # a different version (a workspace member that pins its own `version`
+      # keeps it; bump_version.py rewrites only the root Cargo.toml). The
+      # crate job checks again right before `cargo publish`.
+      - name: Verify package version
+        if: steps.existing.outputs.skip != 'true' && inputs.publish
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ steps.bump.outputs.new_version }}
+        run: python3 "$ACTIONS_DIR/scripts/verify_package_version.py"
 
       # New release: the commits since the last tag, labelled with the new tag
       # (`--latest` would print the PREVIOUS tag's notes, as the tag does not
@@ -351,6 +373,30 @@ jobs:
             git-cliff --config "$CLIFF_CONFIG" --unreleased --tag "$TAG" --strip header > "$RUNNER_TEMP/RELEASE_NOTES.md" || echo "Release ${TAG}" > "$RUNNER_TEMP/RELEASE_NOTES.md"
           fi
           cat "$RUNNER_TEMP/RELEASE_NOTES.md"
+
+      # Self-test (dry run only): in a copy of the workspace WITHOUT cliff.toml
+      # the default $ACTIONS_DIR/cliff.toml is selected and git-cliff succeeds
+      # with it. Checks git-cliff's own exit code; the notes step above masks
+      # a git-cliff failure with a fallback text.
+      - name: "Self-test: git-cliff config fallback"
+        if: steps.existing.outputs.skip != 'true' && inputs.dry_run
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          COPY="$RUNNER_TEMP/cliff-fallback"
+          cp -a "$GITHUB_WORKSPACE" "$COPY"
+          rm -f "$COPY/cliff.toml"
+          CFG=$(cd "$COPY" && bash "$ACTIONS_DIR/scripts/select_cliff_config.sh")
+          if [ "$CFG" != "$ACTIONS_DIR/cliff.toml" ]; then
+            echo "::error::fallback selected '${CFG}', expected '${ACTIONS_DIR}/cliff.toml'"
+            exit 1
+          fi
+          (cd "$COPY" && git-cliff --config "$CFG" --unreleased --tag "$TAG" --strip header) > "$RUNNER_TEMP/fallback-notes.md"
+          cat "$RUNNER_TEMP/fallback-notes.md"
+          grep -qF "## [${TAG#v}]" "$RUNNER_TEMP/fallback-notes.md"
+          rm -rf "$COPY"
+          echo "Fallback to ${CFG} works"
 
       # Annotated tag on the merge commit. Skipped when the tag already exists
       # on the merge commit (re-run); refused when it exists elsewhere.
@@ -411,7 +457,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ steps.bump.outputs.tag }}
           NEW_VERSION: ${{ steps.bump.outputs.new_version }}
-          BASE_BRANCH: ${{ inputs.default_branch }}
+          BASE_BRANCH: ${{ inputs.default_branch || github.event.repository.default_branch }}
         run: |
           # Start from a clean tree before switching branches (bump_version.py
           # rewrote Cargo.toml in place).
@@ -448,13 +494,22 @@ jobs:
           fi
           echo "sha=${OWN_SHA}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - id: own_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: jamshidhq/actions
           ref: ${{ steps.own_sha.outputs.sha }}
           path: .jamshid-actions
           token: ${{ secrets.actions_read_token || github.token }}
           persist-credentials: false
+
+      - name: Explain a failed script checkout
+        if: failure() && steps.own_checkout.outcome == 'failure'
+        env:
+          OWN_SHA: ${{ steps.own_sha.outputs.sha }}
+        run: |
+          echo "::error::cannot read jamshidhq/actions at ${OWN_SHA}: repo private? pass actions_read_token"
+          exit 1
 
       - name: Move scripts out of the workspace
         run: |
@@ -490,27 +545,62 @@ jobs:
           EXISTING_TAG: ${{ needs.release.outputs.tag }}
         run: python3 "$ACTIONS_DIR/scripts/bump_version.py"
 
-      - name: Resolve package
+      # Resolve the package and assert that cargo metadata reports the release
+      # version for it. Fails with ::error:: otherwise, so `cargo publish` can
+      # never upload the old version of a member that pins its own `version`.
+      - name: Resolve package and verify version
         id: pkg
         env:
           PACKAGE: ${{ inputs.package }}
           VERSION: ${{ needs.release.outputs.new_version }}
+        run: python3 "$ACTIONS_DIR/scripts/verify_package_version.py"
+
+      # Self-test (dry run only): the same assertion must FIRE on a version
+      # cargo does not report. The pass condition is the mismatch error itself,
+      # not just a non-zero exit (a missing script also exits non-zero).
+      - name: "Self-test: version assertion fires on a mismatch"
+        if: inputs.dry_run
+        env:
+          PACKAGE: ${{ steps.pkg.outputs.name }}
+          VERSION: 999.0.0-mismatch
+        run: |
+          set +e   # the failing call below is the expected outcome
+          set -uo pipefail
+          OUT=$(GITHUB_OUTPUT=/dev/null python3 "$ACTIONS_DIR/scripts/verify_package_version.py" 2>&1)
+          RC=$?
+          echo "expected error: ${OUT#::error::}"
+          if [ "$RC" -eq 0 ] || ! grep -qF "version mismatch: cargo metadata reports ${PACKAGE} " <<<"$OUT"; then
+            echo "::error::the version assertion did not fire on VERSION=${VERSION} (exit ${RC})"
+            exit 1
+          fi
+          echo "Assertion fired as expected (exit ${RC})"
+
+      # Idempotent re-run: a version already on crates.io is not re-uploaded.
+      # Uses the version verified above. Only 404 means absent; any other
+      # answer (5xx, 429, network error) fails, so a crates.io outage can
+      # never look like "not published yet".
+      - name: Check crates.io
+        id: published
+        env:
+          PACKAGE: ${{ steps.pkg.outputs.name }}
+          VERSION: ${{ steps.pkg.outputs.version }}
           USER_AGENT: "jamshidhq-actions (https://github.com/${{ github.repository }})"
         run: |
-          if [ -z "$PACKAGE" ]; then
-            PACKAGE=$(cargo metadata --no-deps --format-version 1 \
-              | jq -r '.packages | if length == 1 then .[0].name else error("workspace has \(length) packages; set the `package` input") end')
-          fi
-          echo "name=${PACKAGE}" >> "$GITHUB_OUTPUT"
-          # Idempotent re-run: a version already on crates.io is not re-uploaded.
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -A "$USER_AGENT" "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}")
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -A "$USER_AGENT" "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}" || true)
           echo "crates.io ${PACKAGE} ${VERSION}: HTTP ${STATUS}"
-          if [ "$STATUS" = "200" ]; then
-            echo "::notice::${PACKAGE} ${VERSION} is already on crates.io; skipping publish"
-            echo "published=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
+          case "$STATUS" in
+            200)
+              echo "::notice::${PACKAGE} ${VERSION} is already on crates.io; skipping publish"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io answered HTTP ${STATUS} for ${PACKAGE} ${VERSION}; cannot tell whether it is published. Retry later"
+              exit 1
+              ;;
+          esac
 
       # `--allow-dirty`: Cargo.toml was rewritten above. Not `--locked`: the
       # lockfile still names the old version of this crate.
@@ -522,11 +612,11 @@ jobs:
 
       - name: Authenticate with crates.io
         id: auth
-        if: ${{ !inputs.dry_run && steps.pkg.outputs.published != 'true' }}
+        if: ${{ !inputs.dry_run && steps.published.outputs.published != 'true' }}
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9  # v1.0.6
 
       - name: cargo publish
-        if: ${{ !inputs.dry_run && steps.pkg.outputs.published != 'true' }}
+        if: ${{ !inputs.dry_run && steps.published.outputs.published != 'true' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           PACKAGE: ${{ steps.pkg.outputs.name }}

@@ -47,12 +47,19 @@ jobs:
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       publish: true
-    secrets:
-      actions_read_token: ${{ secrets.JAMSHIDHQ_ACTIONS_READ_TOKEN }}
 ```
 
-Path filters, triggers and concurrency stay in the caller. Never pass
-`secrets: inherit`; pass named secrets only.
+Path filters and triggers stay in the caller. Never pass `secrets: inherit`;
+pass named secrets only.
+
+> **Warning: concurrency deadlock.** The `release` job of
+> `rust-release.yaml` holds the concurrency group
+> `jamshidhq-rust-release-<owner>/<repo>` (`github.repository`), with
+> `cancel-in-progress: false`. Do NOT put a concurrency group with that same
+> name on the calling job or the calling workflow. The caller would hold the
+> group while the called job waits for it, and the release never runs. The
+> called workflow serialises releases itself; the caller needs no
+> concurrency group for that.
 
 ## rust-ci.yaml inputs
 
@@ -76,7 +83,7 @@ the hook `rev` callers use, because those hooks refuse other versions.
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `pr_number` | string | `""` | Merged PR to release |
-| `default_branch` | string | `main` | The PR base must be this branch; the bump PR targets it |
+| `default_branch` | string | `""` | The PR base must be this branch; the bump PR targets it. Empty: the repository's default branch (`github.event.repository.default_branch`) |
 | `publish` | boolean | `false` | Publish to crates.io with trusted publishing |
 | `package` | string | `""` | Package to publish. Empty: the only package in the workspace |
 | `environment` | string | `""` | GitHub environment for the publish job |
@@ -88,7 +95,7 @@ the hook `rev` callers use, because those hooks refuse other versions.
 
 | Secret | Required | Meaning |
 | --- | --- | --- |
-| `actions_read_token` | no | Read access to `jamshidhq/actions`. Needed while this repository is private and the caller is another repository (see below) |
+| `actions_read_token` | no | Read access to `jamshidhq/actions`. This repository is public, so normally omit it. Needed only if this repository is made private again (see below) |
 
 Output: `tag`, the released tag.
 
@@ -96,12 +103,15 @@ Output: `tag`, the released tag.
 
 1. `decide` reads the PR. It needs exactly one release label. `no-release`
    and closed-unmerged PRs stop here. A PR merged into another branch fails.
-2. `release` runs under job-level concurrency group `release`. It:
+2. `release` runs under job-level concurrency group
+   `jamshidhq-rust-release-<owner>/<repo>` (see the deadlock warning above). It:
    - reuses a `vX.Y.Z` tag that already points at the merge commit (re-run);
    - skips the whole release when a later tag already contains the merge
      commit (a dropped pending run shipped in that later release);
    - computes the version as max(latest `vX.Y.Z` tag, first `version =` in
      the root `Cargo.toml`) bumped by the label;
+   - with `publish: true`, checks that `cargo metadata` reports the new
+     version for the package, BEFORE the tag exists (see step 3);
    - writes notes with `git-cliff --unreleased --tag` (`--current` on re-run),
      using the caller's `cliff.toml` or the default in this repository;
    - pushes an annotated tag, and refuses if the tag exists on another commit;
@@ -109,8 +119,14 @@ Output: `tag`, the released tag.
    - opens a `no-release` bump PR with `Cargo.toml`, `Cargo.lock` and
      `CHANGELOG.md`, and reuses an existing branch or PR.
 3. `crate` (only with `publish: true`) rewrites `Cargo.toml` to the released
-   version and checks crates.io. An existing version is skipped, so a re-run
-   is safe. Otherwise it gets a token from
+   version. It then asserts that `cargo metadata` reports exactly that
+   version for the package, and fails otherwise. The version bump rewrites
+   only the first `version =` in the root `Cargo.toml`. A workspace member
+   must therefore use `version.workspace = true`; a member that pins its own
+   `version` fails here instead of publishing its old version. It checks
+   crates.io for the verified version: HTTP 200 skips the publish (a re-run
+   is safe), HTTP 404 publishes, any other answer fails ("retry later").
+   To publish, it gets a token from
    `rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9`
    (v1.0.6) and runs `cargo publish`.
 
@@ -132,22 +148,26 @@ its own repository. The options:
 | Option | Result |
 | --- | --- |
 | Composite actions, `uses: jamshidhq/actions/actions/<name>@<sha>` | Not possible to pin correctly. `uses:` inside a workflow must be a literal, so the workflow cannot name its own commit. A literal SHA is always one commit behind and needs a second PR per change. `@main` is a moving ref that breaks the caller's SHA pin |
-| Check out `jamshidhq/actions` at `job.workflow_sha` (chosen) | Scripts always come from the exact commit the caller pinned. No drift, one PR per change. While the repository is private, a cross-repository checkout needs a token |
+| Check out `jamshidhq/actions` at `job.workflow_sha` (chosen) | Scripts always come from the exact commit the caller pinned. No drift, one PR per change. Works without a token while this repository is public |
 
 `rust-release.yaml` checks out `jamshidhq/actions` at `job.workflow_sha`. It
 fails when that value is not a 40-hex SHA, with no fallback to a branch. The
 checkout moves out of the caller's tree to `$RUNNER_TEMP`, so it never enters
 a commit or a crate package. `rust-ci.yaml` needs no scripts.
 
-Private-repository access:
+Repository access:
 
-- Repository setting Actions > Access is "organization". Other jamshidhq
-  repositories can then call these workflows.
-- That setting does not let a caller's `GITHUB_TOKEN` clone this repository.
-  Until this repository is public, give `actions_read_token`: a fine-grained
-  token or GitHub App token with `contents: read` on `jamshidhq/actions` only.
+- `jamshidhq/actions` is public. The caller's `GITHUB_TOKEN` can clone it, so
+  callers normally pass no `actions_read_token`.
+- The workflow always checks out `jamshidhq/actions` (the name is fixed in
+  the workflow). If this repository is made private again, callers in other
+  repositories need `actions_read_token`: a fine-grained token or GitHub App
+  token with `contents: read` on `jamshidhq/actions` only. The Actions >
+  Access setting lets other repositories call the workflows, but it does not
+  let their `GITHUB_TOKEN` clone a private repository.
+- When the checkout fails, the job reports `cannot read jamshidhq/actions at
+  <sha>: repo private? pass actions_read_token`.
 - The self-test in this repository needs no token.
-- After the repository is public, `actions_read_token` can be dropped.
 
 ## crates.io trusted publishing
 
@@ -161,6 +181,10 @@ at `9839ef7bf9b776dcd322a9765ab3d2809faf45ea`):
   top-level workflow. Set the "Workflow filename" to the caller's file (e.g.
   `release.yaml`), not `rust-release.yaml`.
 - If you set the `environment` input, set the same environment on crates.io.
+- Protect that environment with required reviewers, not with
+  deployment-branch rules. The `pull_request` (closed) event runs with
+  `GITHUB_REF` = `refs/pull/<N>/merge`, which a "selected branches" rule may
+  reject. This is unverified: no release has run through an environment yet.
 - crates.io refuses `pull_request_target` and `workflow_run` events.
   `pull_request` (closed) and `workflow_dispatch` are accepted.
 - A public repository is not required. The token exchange does not read the
@@ -173,7 +197,7 @@ at `9839ef7bf9b776dcd322a9765ab3d2809faf45ea`):
 ```sh
 pre-commit install --hook-type pre-commit --hook-type commit-msg
 pre-commit run --all-files
-python3 -m doctest -v scripts/bump_version.py
+python3 -m doctest -v scripts/bump_version.py scripts/verify_package_version.py
 cargo test --workspace --all-features
 actionlint && zizmor --offline .github
 ```

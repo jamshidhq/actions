@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
 
       - name: Python doctests
-        run: python3 -m doctest -v scripts/bump_version.py
+        run: python3 -m doctest -v scripts/bump_version.py scripts/verify_package_version.py
 
       # bump_version.py on the fixture workspace: base max(no tag = 0.0.0,
       # Cargo.toml 0.1.0) = 0.1.0, minor bump -> 0.2.0, Cargo.toml rewritten.
@@ -60,6 +60,30 @@ jobs:
             exit 1
           fi
           echo "Refused EXISTING_TAG=v1.2 as expected"
+
+      # verify_package_version.py exists for one bug: a workspace member that
+      # pins its own `version` keeps it while bump_version.py bumps the root,
+      # so `cargo publish` would upload the OLD version. Green on the fixture
+      # as shipped (version.workspace = true); RED once the member pins its
+      # own version. The pass condition of the red case is the mismatch error.
+      - name: verify_package_version.py on the fixture
+        run: |
+          set -euo pipefail
+          GITHUB_OUTPUT=/dev/null RELEASE_TYPE=minor python3 scripts/bump_version.py
+          VERSION=0.2.0 GITHUB_OUTPUT="$RUNNER_TEMP/verify-output" python3 scripts/verify_package_version.py
+          grep -qx 'name=jamshidhq-actions-fixture' "$RUNNER_TEMP/verify-output"
+          grep -qx 'version=0.2.0' "$RUNNER_TEMP/verify-output"
+          git checkout -- Cargo.toml
+          # Red: the member pins its own version.
+          sed -i 's/^version.workspace = true$/version = "0.1.0"/' tests/fixture-crate/Cargo.toml
+          GITHUB_OUTPUT=/dev/null RELEASE_TYPE=minor python3 scripts/bump_version.py
+          if OUT=$(VERSION=0.2.0 GITHUB_OUTPUT=/dev/null python3 scripts/verify_package_version.py 2>&1); then
+            echo "::error::verify_package_version.py accepted 0.2.0 for a member still at 0.1.0"
+            exit 1
+          fi
+          grep -qF "reports jamshidhq-actions-fixture 0.1.0, the release is 0.2.0" <<<"$OUT"
+          echo "Refused the member pinned at 0.1.0 as expected"
+          git checkout -- Cargo.toml tests/fixture-crate/Cargo.toml
 
   # The release workflow end to end in dry-run mode: decide, version, git-cliff
   # notes and `cargo publish --dry-run`, with every write step skipped. The
