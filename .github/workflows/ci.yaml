@@ -1,0 +1,77 @@
+name: CI
+
+# Self-test: every PR runs the reusable workflows in this repository against
+# the fixture crate (tests/fixture-crate), so a change that breaks a caller
+# breaks here first.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# Cancel superseded runs on the same PR (push storms, label flips).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust-ci:
+    permissions:
+      contents: read
+    # `./` local-call form: the PR's own version of the reusable workflow.
+    uses: ./.github/workflows/rust-ci.yaml  # zizmor: ignore[self-repository]
+    with:
+      feature_args: "--all-features"
+
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Python doctests
+        run: python3 -m doctest -v scripts/bump_version.py
+
+      # bump_version.py on the fixture workspace: base max(no tag = 0.0.0,
+      # Cargo.toml 0.1.0) = 0.1.0, minor bump -> 0.2.0, Cargo.toml rewritten.
+      - name: bump_version.py on the fixture
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/bump-output"
+          GITHUB_OUTPUT="$OUT" RELEASE_TYPE=minor python3 scripts/bump_version.py
+          cat "$OUT"
+          grep -qx 'new_version=0.2.0' "$OUT"
+          grep -qx 'tag=v0.2.0' "$OUT"
+          grep -qx 'tag_exists=false' "$OUT"
+          grep -q '^version = "0.2.0"' Cargo.toml
+          git checkout -- Cargo.toml
+          # Re-run path: an existing tag is reused, no bump.
+          GITHUB_OUTPUT="$OUT.2" RELEASE_TYPE=minor EXISTING_TAG=v0.1.0 python3 scripts/bump_version.py
+          grep -qx 'new_version=0.1.0' "$OUT.2"
+          grep -qx 'tag_exists=true' "$OUT.2"
+          # A malformed tag is refused (the refusal is the pass condition).
+          if GITHUB_OUTPUT=/dev/null RELEASE_TYPE=minor EXISTING_TAG=v1.2 python3 scripts/bump_version.py; then
+            echo "::error::bump_version.py accepted EXISTING_TAG=v1.2"
+            exit 1
+          fi
+          echo "Refused EXISTING_TAG=v1.2 as expected"
+
+  # The release workflow end to end in dry-run mode: decide, version, git-cliff
+  # notes and `cargo publish --dry-run`, with every write step skipped. The
+  # write permissions are what the called workflow declares (GitHub refuses a
+  # call whose jobs ask for more than the caller grants); dry_run uses none.
+  release-dry-run:
+    permissions:
+      contents: write        # declared by the release job (unused in dry run)
+      pull-requests: write   # declared by the release job (unused in dry run)
+      id-token: write        # declared by the crate job (unused in dry run)
+    uses: ./.github/workflows/rust-release.yaml  # zizmor: ignore[self-repository]
+    with:
+      dry_run: true
+      dry_run_release_type: minor
+      publish: true

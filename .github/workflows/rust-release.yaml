@@ -1,0 +1,533 @@
+name: Rust release (reusable)
+
+# Label-driven release on PR merge, extracted from jamshidhq/jamshid's
+# release.yaml + release-run.yaml and generalised for a library crate.
+#
+# The merged PR's single release label (major | minor | patch | no-release)
+# decides the bump. The base version is max(latest vX.Y.Z tag, Cargo.toml
+# version). The tag lands on the PR's merge commit, the GitHub release carries
+# git-cliff notes for the unreleased range, and a follow-up `no-release` PR
+# syncs Cargo.toml + Cargo.lock + CHANGELOG.md. With `publish: true` the crate
+# is then published to crates.io through trusted publishing.
+#
+# CALLER REQUIREMENTS (see README):
+#   - trigger `pull_request: types: [closed]` on the default branch, plus
+#     `workflow_dispatch` with a pr_number input for re-runs. NOT
+#     `pull_request_target` / `workflow_run`: crates.io refuses those events.
+#   - the calling job grants contents: write, pull-requests: write and
+#     id-token: write (a called workflow cannot exceed its caller).
+#   - crates.io trusted publisher config names the CALLER's workflow file
+#     (crates.io matches the `workflow_ref` claim, the top-level workflow),
+#     not rust-release.yaml.
+#
+# DIFFERENCE FROM JAMSHID: jamshid splits a read-only `build` job (binary +
+# packages) from a write `publish` job, inside a nested reusable workflow so
+# one concurrency group covers both. A library has no build artefact, so this
+# workflow computes the version and tags in ONE `release` job under job-level
+# concurrency `release`. One queued job per run means a newer pending run can
+# never slip between version computation and tag push.
+#
+# QUEUE LIMIT (unchanged from jamshid): GitHub keeps at most ONE pending run
+# per concurrency group; a newer pending run cancels the older pending one.
+# The dropped run is always the OLDER one, so its merge commit is an ancestor
+# of the next release and ships in it. Do NOT re-dispatch a dropped PR; the
+# shipped guard below skips it anyway. Re-dispatching a FAILED run is safe:
+# a tag already on the merge commit, an existing release, bump branch, bump PR
+# and an already-published crate version are all reused.
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: >-
+          Merged PR to release. Callers pass
+          `github.event.pull_request.number || inputs.pr_number`.
+        type: string
+        default: ""
+      default_branch:
+        description: "Branch releases are cut from (the PR base must match)"
+        type: string
+        default: "main"
+      publish:
+        description: "Publish the crate to crates.io with trusted publishing"
+        type: boolean
+        default: false
+      package:
+        description: >-
+          Package to publish (cargo -p). Empty: the only package in the
+          workspace.
+        type: string
+        default: ""
+      environment:
+        description: "GitHub environment for the crates.io publish job (optional)"
+        type: string
+        default: ""
+      release_name_prefix:
+        description: "GitHub release title prefix; the tag is appended"
+        type: string
+        default: ""
+      toolchain:
+        description: "Rust toolchain. Empty: the caller's rust-toolchain.toml"
+        type: string
+        default: ""
+      apt_packages:
+        description: "Space-separated apt packages needed by cargo update / cargo publish"
+        type: string
+        default: ""
+      dry_run:
+        description: >-
+          Self-test mode. Computes version and notes on the current commit,
+          runs `cargo publish --dry-run`, and writes NOTHING (no tag, release,
+          bump PR or crates.io upload). Needs no merged PR.
+        type: boolean
+        default: false
+      dry_run_release_type:
+        description: "Release type to simulate when dry_run is true"
+        type: string
+        default: "minor"
+    secrets:
+      actions_read_token:
+        description: >-
+          Token with read access to jamshidhq/actions, used to check out this
+          workflow's scripts at the commit it runs at. Needed only while
+          jamshidhq/actions is private and the caller is another repository.
+        required: false
+    outputs:
+      tag:
+        description: "Released tag (empty when nothing was released)"
+        value: ${{ jobs.release.outputs.tag }}
+
+# NO workflow-level concurrency: every closed PR runs `decide`, and most of
+# them (no-release, closed-unmerged) must not take a slot in the release queue.
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GIT_CLIFF_TOOL: git-cliff@2.14.1
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read   # gh pr view (labels, merge commit, base)
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      release_type: ${{ steps.decide.outputs.release_type }}
+      merge_sha: ${{ steps.decide.outputs.merge_sha }}
+    steps:
+      - name: Decide whether to release
+        id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN_RELEASE_TYPE: ${{ inputs.dry_run_release_type }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            case "$DRY_RUN_RELEASE_TYPE" in
+              major|minor|patch) ;;
+              *) echo "::error::Invalid dry_run_release_type: '${DRY_RUN_RELEASE_TYPE}'"; exit 1 ;;
+            esac
+            echo "Dry run: simulating a ${DRY_RUN_RELEASE_TYPE} release of ${CURRENT_SHA}"
+            {
+              echo "should_release=true"
+              echo "release_type=$DRY_RUN_RELEASE_TYPE"
+              echo "merge_sha=$CURRENT_SHA"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid PR number: '${PR_NUMBER}'"
+            exit 1
+          fi
+
+          # One API path for both triggers: labels + the real merge commit.
+          # (On pull_request events GITHUB_SHA is not the commit on the branch.)
+          PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels,mergeCommit,state,baseRefName)
+          PR_STATE=$(jq -r '.state' <<<"$PR_JSON")
+          if [ "$PR_STATE" != "MERGED" ]; then
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              echo "PR #${PR_NUMBER} closed without merging"
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::PR #${PR_NUMBER} is not merged (state: ${PR_STATE})"
+            exit 1
+          fi
+          # The caller's pull_request trigger should filter on the default
+          # branch; workflow_dispatch cannot.
+          BASE_REF=$(jq -r '.baseRefName' <<<"$PR_JSON")
+          if [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::PR #${PR_NUMBER} was merged into '${BASE_REF}', not ${DEFAULT_BRANCH}"
+            exit 1
+          fi
+          MERGE_SHA=$(jq -r '.mergeCommit.oid' <<<"$PR_JSON")
+          mapfile -t LABELS < <(jq -r '.labels[].name' <<<"$PR_JSON")
+
+          RELEASE_LABELS=()
+          for label in "${LABELS[@]}"; do
+            case "$label" in
+              major|minor|patch|no-release) RELEASE_LABELS+=("$label") ;;
+            esac
+          done
+
+          if [ ${#RELEASE_LABELS[@]} -eq 0 ]; then
+            echo "::error::PR #${PR_NUMBER} has no release label. Add one of: major, minor, patch, no-release"
+            exit 1
+          fi
+          if [ ${#RELEASE_LABELS[@]} -gt 1 ]; then
+            echo "::error::PR #${PR_NUMBER} has conflicting release labels: ${RELEASE_LABELS[*]}"
+            exit 1
+          fi
+
+          LABEL="${RELEASE_LABELS[0]}"
+          if [ "$LABEL" = "no-release" ]; then
+            echo "no-release label, skipping release"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Release type: $LABEL (merge commit ${MERGE_SHA})"
+          {
+            echo "should_release=true"
+            echo "release_type=$LABEL"
+            echo "merge_sha=$MERGE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: decide
+    if: needs.decide.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Dry runs get their own group so a PR self-test never queues behind (or
+    # cancels the pending slot of) a real release.
+    concurrency:
+      group: ${{ inputs.dry_run && format('release-dry-run-{0}', github.run_id) || 'release' }}
+      cancel-in-progress: false
+    permissions:
+      contents: write        # push tag + bump branch, create release
+      pull-requests: write   # open the bump PR
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      new_version: ${{ steps.bump.outputs.new_version }}
+      # "true" when the merge commit already shipped inside a later release.
+      skip: ${{ steps.existing.outputs.skip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.decide.outputs.merge_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # SCRIPT LOADING: a reusable workflow runs in the CALLER's workspace and
+      # cannot see its own repository's files. Check out jamshidhq/actions at
+      # the exact commit this workflow file runs at (job.workflow_sha, read
+      # through fromJSON(toJSON(job)) because actionlint types `job` strictly).
+      # No fallback to a branch: scripts and workflow always match.
+      - name: Resolve this workflow's commit
+        id: own_sha
+        env:
+          OWN_SHA: ${{ fromJSON(toJSON(job)).workflow_sha }}
+        run: |
+          if [[ ! "$OWN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha is not a 40-hex commit SHA: '${OWN_SHA}'"
+            exit 1
+          fi
+          echo "sha=${OWN_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: jamshidhq/actions
+          ref: ${{ steps.own_sha.outputs.sha }}
+          path: .jamshid-actions
+          token: ${{ secrets.actions_read_token || github.token }}
+          persist-credentials: false
+
+      # Out of the caller's tree, so it never lands in a commit or a package.
+      - name: Move scripts out of the workspace
+        run: |
+          mv .jamshid-actions "$RUNNER_TEMP/jamshid-actions"
+          echo "ACTIONS_DIR=$RUNNER_TEMP/jamshid-actions" >> "$GITHUB_ENV"
+
+      # Idempotent re-run: a vX.Y.Z tag already on the merge commit is reused
+      # (no second bump, no second tag).
+      # Shipped guard: if no tag is ON the commit but a vX.Y.Z tag CONTAINS it,
+      # the commit already shipped in that later release (e.g. a dropped
+      # pending run whose PR was superseded). Releasing it now would put a
+      # higher version on older code, so every later step and the publish job
+      # skip (skip=true; the run stays green).
+      - name: Find existing release tag
+        id: existing
+        env:
+          MERGE_SHA: ${{ needs.decide.outputs.merge_sha }}
+        run: |
+          semver() { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; }
+          EXISTING=$(git tag --points-at "$MERGE_SHA" --list 'v[0-9]*' | semver | sort -V | tail -n 1)
+          echo "Existing tag on ${MERGE_SHA}: ${EXISTING:-none}"
+          echo "tag=${EXISTING}" >> "$GITHUB_OUTPUT"
+          SKIP=false
+          if [ -z "$EXISTING" ]; then
+            SHIPPED=$(git tag --contains "$MERGE_SHA" --list 'v[0-9]*' | semver | sort -V | head -n 1)
+            if [ -n "$SHIPPED" ]; then
+              echo "::notice::commit ${MERGE_SHA} already shipped in ${SHIPPED}; skipping release"
+              SKIP=true
+            fi
+          fi
+          echo "skip=${SKIP}" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        if: steps.existing.outputs.skip != 'true' && inputs.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt_packages }}
+        run: |
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      # create_bump_pr.py runs cargo to sync Cargo.lock.
+      - name: Install Rust toolchain
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          if [ -n "$TOOLCHAIN" ]; then
+            rustup toolchain install "$TOOLCHAIN" --profile minimal
+            echo "RUSTUP_TOOLCHAIN=${TOOLCHAIN}" >> "$GITHUB_ENV"
+          else
+            rustup toolchain install
+          fi
+          rustc --version
+
+      # No rust-cache here on purpose: a cache restored into a release job is a
+      # cache-poisoning vector (zizmor `cache-poisoning`), and releases are rare.
+      - name: Install git-cliff
+        if: steps.existing.outputs.skip != 'true'
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8  # v2.87.28
+        with:
+          tool: ${{ env.GIT_CLIFF_TOOL }}
+
+      # The caller's cliff.toml wins; otherwise the default shipped here.
+      - name: Select git-cliff config
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          if [ -f cliff.toml ]; then
+            CFG="$GITHUB_WORKSPACE/cliff.toml"
+          else
+            CFG="$ACTIONS_DIR/cliff.toml"
+          fi
+          echo "git-cliff config: ${CFG}"
+          echo "CLIFF_CONFIG=${CFG}" >> "$GITHUB_ENV"
+
+      - name: Bump version
+        if: steps.existing.outputs.skip != 'true'
+        id: bump
+        env:
+          RELEASE_TYPE: ${{ needs.decide.outputs.release_type }}
+          EXISTING_TAG: ${{ steps.existing.outputs.tag }}
+        run: python3 "$ACTIONS_DIR/scripts/bump_version.py"
+
+      # New release: the commits since the last tag, labelled with the new tag
+      # (`--latest` would print the PREVIOUS tag's notes, as the tag does not
+      # exist yet). Re-run: the tag exists on HEAD (the merge commit), so
+      # `--current` prints exactly that tag's notes.
+      - name: Generate release notes
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          TAG_EXISTS: ${{ steps.bump.outputs.tag_exists }}
+        run: |
+          if [ "$TAG_EXISTS" = "true" ]; then
+            git-cliff --config "$CLIFF_CONFIG" --current --strip header > "$RUNNER_TEMP/RELEASE_NOTES.md" || echo "Release ${TAG}" > "$RUNNER_TEMP/RELEASE_NOTES.md"
+          else
+            git-cliff --config "$CLIFF_CONFIG" --unreleased --tag "$TAG" --strip header > "$RUNNER_TEMP/RELEASE_NOTES.md" || echo "Release ${TAG}" > "$RUNNER_TEMP/RELEASE_NOTES.md"
+          fi
+          cat "$RUNNER_TEMP/RELEASE_NOTES.md"
+
+      # Annotated tag on the merge commit. Skipped when the tag already exists
+      # on the merge commit (re-run); refused when it exists elsewhere.
+      - name: Create and push tag
+        if: steps.existing.outputs.skip != 'true' && !inputs.dry_run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          MERGE_SHA: ${{ needs.decide.outputs.merge_sha }}
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Auth via per-process git config env, so the token is never written
+          # to .git/config (no `remote set-url` with credentials).
+          AUTH=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)
+          echo "::add-mask::${AUTH}"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then
+            git fetch --quiet origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+            TAG_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
+            if [ "$TAG_SHA" != "$MERGE_SHA" ]; then
+              echo "::error::Tag ${TAG} exists on remote at ${TAG_SHA}, not on merge commit ${MERGE_SHA}"
+              exit 1
+            fi
+            echo "Tag ${TAG} already exists on remote at ${MERGE_SHA}, skipping"
+          else
+            echo "Creating tag: ${TAG}"
+            git tag -a "${TAG}" -m "Release ${TAG}" -m "$(cat "$RUNNER_TEMP/RELEASE_NOTES.md")"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      # gh instead of an action: no assets to upload for a library. Idempotent:
+      # an existing release for the tag gets its notes refreshed.
+      - name: Create GitHub release
+        if: steps.existing.outputs.skip != 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          NAME_PREFIX: ${{ inputs.release_name_prefix }}
+        run: |
+          TITLE="${NAME_PREFIX:+${NAME_PREFIX} }${TAG}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists, updating notes"
+            gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md"
+          else
+            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TITLE" --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md"
+          fi
+
+      # KNOWN GITHUB LIMITATION — the bump PR does not get CI.
+      # A PR opened with GITHUB_TOKEN does not trigger other workflows, so the
+      # caller's CI never runs on chore/bump-vX.Y.Z. Close and reopen it (a
+      # human event) to get CI. REQUIRES the repo setting "Allow GitHub Actions
+      # to create and approve pull requests" (Settings > Actions > General).
+      - name: Create version bump PR
+        if: steps.existing.outputs.skip != 'true' && !inputs.dry_run
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          BASE_BRANCH: ${{ inputs.default_branch }}
+        run: |
+          # Start from a clean tree before switching branches (bump_version.py
+          # rewrote Cargo.toml in place).
+          git checkout -- Cargo.toml
+          git checkout -- Cargo.lock 2>/dev/null || true
+          python3 "$ACTIONS_DIR/scripts/create_bump_pr.py"
+
+  # crates.io publish via trusted publishing. Only `id-token: write` on top of
+  # read: the short-lived crates.io token never shares a job with the
+  # GITHUB_TOKEN write scopes.
+  crate:
+    needs: [decide, release]
+    if: inputs.publish && needs.release.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write        # OIDC token for crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.decide.outputs.merge_sha }}
+          persist-credentials: false
+
+      - name: Resolve this workflow's commit
+        id: own_sha
+        env:
+          OWN_SHA: ${{ fromJSON(toJSON(job)).workflow_sha }}
+        run: |
+          if [[ ! "$OWN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::job.workflow_sha is not a 40-hex commit SHA: '${OWN_SHA}'"
+            exit 1
+          fi
+          echo "sha=${OWN_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: jamshidhq/actions
+          ref: ${{ steps.own_sha.outputs.sha }}
+          path: .jamshid-actions
+          token: ${{ secrets.actions_read_token || github.token }}
+          persist-credentials: false
+
+      - name: Move scripts out of the workspace
+        run: |
+          mv .jamshid-actions "$RUNNER_TEMP/jamshid-actions"
+          echo "ACTIONS_DIR=$RUNNER_TEMP/jamshid-actions" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        if: inputs.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt_packages }}
+        run: |
+          sudo apt-get update -qq
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Install Rust toolchain
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          if [ -n "$TOOLCHAIN" ]; then
+            rustup toolchain install "$TOOLCHAIN" --profile minimal
+            echo "RUSTUP_TOOLCHAIN=${TOOLCHAIN}" >> "$GITHUB_ENV"
+          else
+            rustup toolchain install
+          fi
+          rustc --version
+
+      # The merge commit still carries the OLD version; the bump PR lands
+      # later. Rewrite Cargo.toml to the released tag (EXISTING_TAG: no bump).
+      - name: Set released version in Cargo.toml
+        env:
+          RELEASE_TYPE: ${{ needs.decide.outputs.release_type }}
+          EXISTING_TAG: ${{ needs.release.outputs.tag }}
+        run: python3 "$ACTIONS_DIR/scripts/bump_version.py"
+
+      - name: Resolve package
+        id: pkg
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ needs.release.outputs.new_version }}
+          USER_AGENT: "jamshidhq-actions (https://github.com/${{ github.repository }})"
+        run: |
+          if [ -z "$PACKAGE" ]; then
+            PACKAGE=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages | if length == 1 then .[0].name else error("workspace has \(length) packages; set the `package` input") end')
+          fi
+          echo "name=${PACKAGE}" >> "$GITHUB_OUTPUT"
+          # Idempotent re-run: a version already on crates.io is not re-uploaded.
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -A "$USER_AGENT" "https://crates.io/api/v1/crates/${PACKAGE}/${VERSION}")
+          echo "crates.io ${PACKAGE} ${VERSION}: HTTP ${STATUS}"
+          if [ "$STATUS" = "200" ]; then
+            echo "::notice::${PACKAGE} ${VERSION} is already on crates.io; skipping publish"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `--allow-dirty`: Cargo.toml was rewritten above. Not `--locked`: the
+      # lockfile still names the old version of this crate.
+      - name: cargo publish --dry-run
+        if: inputs.dry_run
+        env:
+          PACKAGE: ${{ steps.pkg.outputs.name }}
+        run: cargo publish --dry-run --allow-dirty -p "$PACKAGE"
+
+      - name: Authenticate with crates.io
+        id: auth
+        if: ${{ !inputs.dry_run && steps.pkg.outputs.published != 'true' }}
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9  # v1.0.6
+
+      - name: cargo publish
+        if: ${{ !inputs.dry_run && steps.pkg.outputs.published != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          PACKAGE: ${{ steps.pkg.outputs.name }}
+        run: cargo publish --allow-dirty -p "$PACKAGE"
