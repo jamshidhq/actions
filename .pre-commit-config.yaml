@@ -41,7 +41,7 @@ repos:
 
       - id: python-doctests
         name: python doctests (scripts/)
-        entry: python3 -m doctest scripts/bump_version.py scripts/verify_package_version.py
+        entry: python3 -m doctest scripts/bump_version.py scripts/verify_package_version.py scripts/create_bump_pr.py
         language: system
         files: ^scripts/.*\.py$
         pass_filenames: false
