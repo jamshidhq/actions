@@ -1,0 +1,12 @@
+# Virtual workspace for the self-test only. It exists so the shared cargo
+# pre-commit hooks (which run at the repository root) and the reusable
+# workflows have a real crate to check. Nothing here is published.
+[workspace]
+members = ["tests/fixture-crate"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/jamshidhq/actions"

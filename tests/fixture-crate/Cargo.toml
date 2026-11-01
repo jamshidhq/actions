@@ -1,0 +1,11 @@
+[package]
+name = "jamshidhq-actions-fixture"
+description = "Fixture crate that the jamshidhq/actions self-test runs the reusable workflows on"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# One feature, so the `feature_args` input has something to switch on.
+extra = []

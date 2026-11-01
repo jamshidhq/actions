@@ -1,0 +1,195 @@
+name: Rust CI (reusable)
+
+# Pull-request CI for a Rust crate or workspace, extracted from
+# jamshidhq/jamshid's ci.yaml. The CALLER owns the trigger, path filters and
+# concurrency; this workflow owns the checks:
+#
+#   release label (exactly one of major/minor/patch/no-release, PR events only)
+#   pre-commit --all-files, cargo fmt, cargo clippy -D warnings, cargo test,
+#   cargo-deny, typos, actionlint, zizmor
+#
+# Tool versions are pinned here. cargo-deny, gitleaks and actionlint MUST stay
+# equal to what yadgarhq/actions' versions.yaml pins at the hook rev callers
+# use: those hooks refuse any other version.
+on:
+  workflow_call:
+    inputs:
+      toolchain:
+        description: >-
+          Rust toolchain to use. Empty (default) installs what the caller's
+          rust-toolchain.toml pins.
+        type: string
+        default: ""
+      feature_args:
+        description: "Feature flags passed to cargo clippy and cargo test"
+        type: string
+        default: "--all-features"
+      apt_packages:
+        description: "Space-separated apt packages the crate needs to build (e.g. libssl-dev)"
+        type: string
+        default: ""
+      check_release_label:
+        description: "Require exactly one release label on pull_request events"
+        type: boolean
+        default: true
+      run_tests:
+        description: "Run cargo test"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # Keep in step with yadgarhq/actions versions.yaml (see header).
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  PRE_COMMIT_VERSION: "4.7.0"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Validate release label
+        if: inputs.check_release_label && startsWith(github.event_name, 'pull_request')
+        shell: bash
+        env:
+          # Labels come from the event payload: `labeled`/`unlabeled` events
+          # carry the PR's current label set, so no API call is needed.
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          mapfile -t LABELS < <(jq -r '.[]' <<<"$LABELS_JSON")
+
+          RELEASE_LABELS=()
+          for label in "${LABELS[@]}"; do
+            case "$label" in
+              major|minor|patch|no-release) RELEASE_LABELS+=("$label") ;;
+            esac
+          done
+
+          if [ ${#RELEASE_LABELS[@]} -eq 0 ]; then
+            echo "::error::Missing release label. Add one of: major, minor, patch, no-release"
+            exit 1
+          fi
+          if [ ${#RELEASE_LABELS[@]} -gt 1 ]; then
+            echo "::error::Conflicting release labels: ${RELEASE_LABELS[*]}"
+            exit 1
+          fi
+
+          echo "Release label: ${RELEASE_LABELS[0]}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install system dependencies
+        if: inputs.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt_packages }}
+        run: |
+          sudo apt-get update -qq
+          # Word splitting is the point: a space-separated package list.
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
+
+      - name: Install Rust toolchain
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          if [ -n "$TOOLCHAIN" ]; then
+            rustup toolchain install "$TOOLCHAIN" --profile minimal -c clippy,rustfmt
+            echo "RUSTUP_TOOLCHAIN=${TOOLCHAIN}" >> "$GITHUB_ENV"
+          else
+            # Version + components from the caller's rust-toolchain.toml.
+            rustup toolchain install
+          fi
+          rustc --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+
+      - name: Install cargo-deny, typos and zizmor
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8  # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2,typos@1.51.1,zizmor@1.29.0
+
+      # Not in install-action's manifests at the pin above: downloaded and
+      # checked against the sha256 yadgarhq/actions versions.yaml records.
+      - name: Install actionlint and gitleaks
+        run: |
+          set -euo pipefail
+          file="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${file}" | sha256sum -c -
+          sudo tar -xzf "$file" -C /usr/local/bin actionlint
+          file="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL -o "$file" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${file}" | sha256sum -c -
+          sudo tar -xzf "$file" -C /usr/local/bin gitleaks
+          actionlint -version | head -n 1
+          gitleaks version
+          # The runner image ships shellcheck; the yadgarhq actionlint hook
+          # refuses to run without it.
+          shellcheck --version | head -n 2
+
+      - name: Install pre-commit
+        run: pipx install "pre-commit==${PRE_COMMIT_VERSION}"
+
+      # The gitleaks hook scans the index (`--staged`), which is empty here, so
+      # it passes over zero bytes in CI. It is a local guard only.
+      - name: Run pre-commit (all files)
+        run: |
+          if [ ! -f .pre-commit-config.yaml ]; then
+            echo "::warning::No .pre-commit-config.yaml in this repository; pre-commit checked nothing"
+            exit 0
+          fi
+          pre-commit run --all-files --show-diff-on-failure
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        env:
+          FEATURE_ARGS: ${{ inputs.feature_args }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo clippy --workspace --all-targets $FEATURE_ARGS -- -D warnings
+
+      - name: cargo test
+        if: inputs.run_tests
+        env:
+          FEATURE_ARGS: ${{ inputs.feature_args }}
+        run: |
+          # shellcheck disable=SC2086
+          cargo test --workspace $FEATURE_ARGS
+
+      - name: cargo deny
+        run: cargo deny --all-features check
+
+      - name: typos
+        run: typos
+
+      - name: actionlint
+        run: |
+          if compgen -G ".github/workflows/*.y*ml" >/dev/null; then
+            actionlint
+          else
+            echo "::warning::No workflows to lint"
+          fi
+
+      # Offline: the online audits call the GitHub API for third-party repos and
+      # make the result depend on the network.
+      - name: zizmor
+        run: |
+          if [ -d .github ]; then
+            zizmor --offline --no-progress .github
+          else
+            echo "::warning::No .github directory to audit"
+          fi
